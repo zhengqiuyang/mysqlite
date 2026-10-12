@@ -62,13 +62,12 @@ class TableTests(unittest.TestCase):
             self.table.insert(Row(1, "b", "b@x"))
         self.assertIn("已存在", str(ctx.exception))
 
-    def test_leaf_capacity(self):
-        for i in range(LEAF_MAX_CELLS):
+    def test_grows_beyond_single_leaf(self):
+        # M2 起叶满会分裂,不再报"表已满"
+        total = LEAF_MAX_CELLS + 10
+        for i in range(total):
             self.table.insert(Row(i, f"u{i}", "e@x"))
-        with self.assertRaises(MysqliteError) as ctx:
-            self.table.insert(Row(999, "extra", "e@x"))
-        self.assertIn("M2", str(ctx.exception))  # 提示结点分裂尚未实现
-        self.assertEqual(sum(1 for _ in self.table.scan()), LEAF_MAX_CELLS)
+        self.assertEqual([r.id for r in self.table.scan()], list(range(total)))
 
     def test_persistence_across_close(self):
         for i in [10, 3, 7]:
@@ -90,6 +89,81 @@ class TableTests(unittest.TestCase):
         self.close_and_reopen()
         self.table.insert(Row(2, "b", "b@x"))
         self.assertEqual([r.id for r in self.table.scan()], [1, 2])
+
+
+class BTreeTests(unittest.TestCase):
+    """M2:叶分裂、内部结点、多级树。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, "btree.db")
+        self.table = Table(Pager(self.path))
+
+    def ids(self):
+        return [r.id for r in self.table.scan()]
+
+    def test_first_split_creates_internal_root(self):
+        for i in range(LEAF_MAX_CELLS + 1):  # 15 行触发第一次分裂
+            self.table.insert(Row(i, f"u{i}", "e@x"))
+        root = self.table.pager.get_page(self.table.pager.root_page)
+        self.assertEqual(root[0], 2)  # NODE_INTERNAL
+        self.assertEqual(self.ids(), list(range(LEAF_MAX_CELLS + 1)))
+
+    def test_split_with_descending_inserts(self):
+        # 逆序插入最容易暴露分裂/搬运 bug
+        for i in reversed(range(50)):
+            self.table.insert(Row(i, f"u{i}", "e@x"))
+        self.assertEqual(self.ids(), list(range(50)))
+
+    def test_many_shuffled_rows(self):
+        import random
+        ids = list(range(200))
+        random.Random(42).shuffle(ids)
+        for i in ids:
+            self.table.insert(Row(i, f"user{i}", f"u{i}@x"))
+        self.assertEqual(self.ids(), list(range(200)))
+        # 抽查内容没有被搬错
+        rows = {r.id: r for r in self.table.scan()}
+        self.assertEqual(rows[137].username, "user137")
+
+    def test_deep_tree_three_levels(self):
+        # 每叶 14 行;内部结点最多 511 格 → 511*14=7154 行内是两层,
+        # 超过 7154 行必然出现三层
+        total = 8000
+        for i in range(total):
+            self.table.insert(Row(i, f"u{i}", "e@x"))
+        text, depth = self.table.dump_tree()
+        self.assertGreaterEqual(depth, 3)
+        self.assertEqual(len(self.ids()), total)
+        # 根 + 至少 2 个中间层内部结点
+        self.assertGreaterEqual(text.count("[内部]"), 3)
+
+    def test_deep_tree_persistence(self):
+        total = 3000
+        for i in range(total):
+            self.table.insert(Row(i, f"u{i}", "e@x"))
+        self.table.close()
+        self.table = Table(Pager(self.path))
+        self.assertEqual(len(self.ids()), total)
+        rows = {r.id: r for r in self.table.scan()}
+        self.assertEqual(rows[2999].username, "u2999")
+
+    def test_duplicate_id_in_tree(self):
+        for i in range(30):
+            self.table.insert(Row(i, "u", "e@x"))
+        with self.assertRaises(MysqliteError) as ctx:
+            self.table.insert(Row(17, "dup", "d@x"))
+        self.assertIn("已存在", str(ctx.exception))
+
+    def test_dumptree_output(self):
+        for i in range(30):
+            self.table.insert(Row(i, f"u{i}", "e@x"))
+        text, depth = self.table.dump_tree()
+        self.assertIn("[内部]", text)
+        self.assertIn("[叶]", text)
+        self.assertIn("深度:", text)
+        self.assertGreaterEqual(depth, 2)
 
 
 class ReplTests(unittest.TestCase):

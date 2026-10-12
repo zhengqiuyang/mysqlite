@@ -3,7 +3,8 @@
 
 M1 pager + REPL:定长页(4KB)分页文件、页缓存与落盘、行序列化
    (id + username + email)、单叶结点按 id 有序插入、全表扫描、REPL。
-M2 B-tree:叶结点分裂、内部结点、多级树
+M2 B-tree:叶结点分裂、内部结点(cell = 子页 + 子树最大键)、
+   递归插入与分裂上提、多级树、叶链(供 M3 范围扫描)、.dumptree
 M3 WHERE:id 等值走树下降查找,范围走叶链,其他列全表扫描过滤
 
 文件布局:页 0 是数据库头(magic + 页大小 + 根页号 + 总页数),
@@ -174,35 +175,214 @@ def leaf_cell_id(page, i):
     return struct.unpack_from(">I", page, LEAF_HEADER_SIZE + i * ROW_SIZE)[0]
 
 
+# ---------- 内部结点(M2) ----------
+# 布局:type(1) + cell_count(2) + right_child(4) + cells
+# 每个格子:child_page(4) + 该子树的最大键(4)
+
+INTERNAL_CELL_SIZE = 8
+INTERNAL_MAX_CELLS = (PAGE_SIZE - LEAF_HEADER_SIZE) // INTERNAL_CELL_SIZE  # 511
+
+
+def internal_init(page):
+    page[0] = NODE_INTERNAL
+    struct.pack_into(">H", page, 1, 0)
+    struct.pack_into(">I", page, 3, 0)
+
+
+def internal_cell_count(page):
+    return struct.unpack_from(">H", page, 1)[0]
+
+
+def internal_set_cell_count(page, count):
+    struct.pack_into(">H", page, 1, count)
+
+
+def internal_right_child(page):
+    return struct.unpack_from(">I", page, 3)[0]
+
+
+def internal_set_right_child(page, n):
+    struct.pack_into(">I", page, 3, n)
+
+
+def internal_cell(page, i):
+    """返回 (child_page, 子树最大键)。"""
+    start = LEAF_HEADER_SIZE + i * INTERNAL_CELL_SIZE
+    child, key = struct.unpack_from(">II", page, start)
+    return child, key
+
+
+def internal_write_cell(page, i, child, key):
+    start = LEAF_HEADER_SIZE + i * INTERNAL_CELL_SIZE
+    struct.pack_into(">II", page, start, child, key)
+
+
 # ---------- 表:插入与全表扫描 ----------
 
 class Table:
     def __init__(self, pager):
         self.pager = pager
 
+    # ----- 插入:递归下降 + 分裂上提 -----
+
     def insert(self, row):
+        result = self._insert(self.pager.root_page, row)
+        if result is not None:
+            # 根分裂:建一个新的内部结点当根
+            left_max, _right_max, new_right = result
+            old_root = self.pager.root_page
+            root_no, root = self.pager.new_page()
+            internal_init(root)
+            internal_write_cell(root, 0, old_root, left_max)
+            internal_set_right_child(root, new_right)
+            internal_set_cell_count(root, 1)
+            self.pager.root_page = root_no
+
+    def _insert(self, page_no, row):
+        """递归插入。子结点分裂时返回 (左子树max, 右子树max, 新右结点页号)。"""
+        page = self.pager.get_page(page_no)
+        if page[0] == NODE_LEAF:
+            return self._insert_leaf(page_no, page, row)
+        count = internal_cell_count(page)
+        child = internal_right_child(page)
+        cell_index = count  # 默认下降进右孩子
+        for i in range(count):
+            c, key = internal_cell(page, i)
+            if key >= row.id:
+                child, cell_index = c, i
+                break
+        result = self._insert(child, row)
+        if result is None:
+            return None
+        left_max, right_max, new_right = result
+        # 先在逻辑层面组装格子,页内永远不出现第 MAX+1 个格子
+        cells = [internal_cell(page, i) for i in range(count)]
+        if cell_index == count:
+            # 右孩子分裂:左半保留为右孩子,原右孩子降格成格子,新结点接管右孩子
+            cells.append((child, left_max))
+            new_right_child = new_right
+        else:
+            # 下降进的那个格子分裂:更新它的键,新结点插到它后面
+            old_child, _old_key = cells[cell_index]
+            cells[cell_index] = (old_child, left_max)
+            cells.insert(cell_index + 1, (new_right, right_max))
+            new_right_child = internal_right_child(page)
+        if len(cells) <= INTERNAL_MAX_CELLS:
+            internal_set_cell_count(page, len(cells))
+            for i, (c, k) in enumerate(cells):
+                internal_write_cell(page, i, c, k)
+            internal_set_right_child(page, new_right_child)
+            return None
+        return self._split_internal_cells(page, cells, new_right_child)
+
+    def _insert_leaf(self, _page_no, page, row):
         data = serialize_row(row)
-        page = self.pager.get_page(self.pager.root_page)
-        if page[0] != NODE_LEAF:
-            raise MysqliteError("根结点不是叶结点(M2 引入内部结点后才会出现)")
         count = leaf_cell_count(page)
-        if count >= LEAF_MAX_CELLS:
-            raise MysqliteError(
-                f"表已满:单叶结点最多 {LEAF_MAX_CELLS} 行"
-                "(结点分裂在 M2 实现)")
         ids = [leaf_cell_id(page, i) for i in range(count)]
         pos = bisect.bisect_left(ids, row.id)
         if pos < count and ids[pos] == row.id:
             raise MysqliteError(f"id {row.id} 已存在")
-        for i in range(count, pos, -1):  # 右移腾位
-            leaf_write_cell(page, i, leaf_cell(page, i - 1))
-        leaf_write_cell(page, pos, data)
-        leaf_set_cell_count(page, count + 1)
+        if count < LEAF_MAX_CELLS:
+            for i in range(count, pos, -1):
+                leaf_write_cell(page, i, leaf_cell(page, i - 1))
+            leaf_write_cell(page, pos, data)
+            leaf_set_cell_count(page, count + 1)
+            return None
+        # 满:插入逻辑序列后对半分裂
+        cells = [leaf_cell(page, i) for i in range(count)]
+        cells.insert(pos, data)
+        split_at = len(cells) // 2  # 左半行数
+        leaf_set_cell_count(page, split_at)
+        for i in range(split_at):
+            leaf_write_cell(page, i, cells[i])
+        new_no, new_page = self.pager.new_page()
+        leaf_init(new_page)
+        right_cells = cells[split_at:]
+        for i, cell in enumerate(right_cells):
+            leaf_write_cell(new_page, i, cell)
+        leaf_set_cell_count(new_page, len(right_cells))
+        # 维护叶链(M3 范围扫描用)
+        leaf_set_next(new_page, leaf_next(page))
+        leaf_set_next(page, new_no)
+        return (leaf_cell_id(page, split_at - 1),
+                leaf_cell_id(new_page, len(right_cells) - 1),
+                new_no)
+
+    def _split_internal_cells(self, page, cells, right_child):
+        """把"已超容的格子列表 + 右孩子"对半分裂成两个内部结点。"""
+        count = len(cells)
+        split_at = count // 2
+        split_child, split_key = cells[split_at]
+        # 左半:cells[:split_at],右孩子指向 cells[split_at] 的孩子;
+        # 左半子树最大键恰好就是被抬上去的分隔键 split_key
+        internal_set_cell_count(page, split_at)
+        for i in range(split_at):
+            c, k = cells[i]
+            internal_write_cell(page, i, c, k)
+        internal_set_right_child(page, split_child)
+        # 右半:cells[split_at+1:],右孩子为原右孩子
+        new_no, new_page = self.pager.new_page()
+        internal_init(new_page)
+        right_cells = cells[split_at + 1:]
+        for i, (c, k) in enumerate(right_cells):
+            internal_write_cell(new_page, i, c, k)
+        internal_set_cell_count(new_page, len(right_cells))
+        internal_set_right_child(new_page, right_child)
+        return (split_key, self._subtree_max(right_child), new_no)
+
+    def _subtree_max(self, page_no):
+        page = self.pager.get_page(page_no)
+        while page[0] == NODE_INTERNAL:
+            page_no = internal_right_child(page)
+            page = self.pager.get_page(page_no)
+        return leaf_cell_id(page, leaf_cell_count(page) - 1)
+
+    # ----- 查询 -----
 
     def scan(self):
-        page = self.pager.get_page(self.pager.root_page)
-        for i in range(leaf_cell_count(page)):
-            yield deserialize_row(leaf_cell(page, i))
+        """中序遍历整棵树,按 id 有序产出全部行。"""
+        yield from self._scan(self.pager.root_page)
+
+    def _scan(self, page_no):
+        page = self.pager.get_page(page_no)
+        if page[0] == NODE_LEAF:
+            for i in range(leaf_cell_count(page)):
+                yield deserialize_row(leaf_cell(page, i))
+            return
+        count = internal_cell_count(page)
+        for i in range(count):
+            yield from self._scan(internal_cell(page, i)[0])
+        yield from self._scan(internal_right_child(page))
+
+    def dump_tree(self):
+        """返回 (树形文本, 深度层数),供 .dumptree 与测试使用。"""
+        lines = []
+        deepest = [0]
+
+        def walk(page_no, depth):
+            page = self.pager.get_page(page_no)
+            indent = "  " * depth
+            deepest[0] = max(deepest[0], depth + 1)
+            if page[0] == NODE_LEAF:
+                count = leaf_cell_count(page)
+                if count:
+                    text = (f"页 {page_no} [叶] {count} 行 "
+                            f"(id {leaf_cell_id(page, 0)}..{leaf_cell_id(page, count - 1)})")
+                else:
+                    text = f"页 {page_no} [叶] 空"
+                lines.append(indent + text)
+                return
+            count = internal_cell_count(page)
+            keys = [internal_cell(page, i)[1] for i in range(count)]
+            lines.append(f"{indent}页 {page_no} [内部] {count} 格子 "
+                         f"键 {keys} 右孩子 页 {internal_right_child(page)}")
+            for i in range(count):
+                walk(internal_cell(page, i)[0], depth + 1)
+            walk(internal_right_child(page), depth + 1)
+
+        walk(self.pager.root_page, 0)
+        lines.append(f"深度: {deepest[0]} 层  总页数: {self.pager.num_pages}")
+        return "\n".join(lines), deepest[0]
 
     def close(self):
         self.pager.flush()
@@ -216,6 +396,7 @@ HELP = """\
   select                           全表扫描(按 id 有序)
 元命令:
   .dbinfo    显示数据库信息
+  .dumptree  打印 B-tree 结构(M2)
   .help      本帮助
   .exit      退出并落盘"""
 
@@ -273,6 +454,9 @@ class Db:
             return (f"页大小: {PAGE_SIZE}  总页数: {self.table.pager.num_pages}  "
                     f"根页: {self.table.pager.root_page}  行数: {rows}  "
                     f"每叶最大行数: {LEAF_MAX_CELLS}")
+        if line == ".dumptree":
+            text, _depth = self.table.dump_tree()
+            return text
         raise MysqliteError(f"未知的元命令 {line!r}(输入 .help 查看帮助)")
 
 

@@ -5,7 +5,8 @@ M1 pager + REPL:定长页(4KB)分页文件、页缓存与落盘、行序列化
    (id + username + email)、单叶结点按 id 有序插入、全表扫描、REPL。
 M2 B-tree:叶结点分裂、内部结点(cell = 子页 + 子树最大键)、
    递归插入与分裂上提、多级树、叶链(供 M3 范围扫描)、.dumptree
-M3 WHERE:id 等值走树下降查找,范围走叶链,其他列全表扫描过滤
+M3 WHERE:id 等值走树下降 + 叶内二分,id 范围走叶链,
+   其他列(username/email)全表扫描过滤
 
 文件布局:页 0 是数据库头(magic + 页大小 + 根页号 + 总页数),
 树结点占页 1..N。页内格式见各结点函数的注释。
@@ -354,6 +355,69 @@ class Table:
             yield from self._scan(internal_cell(page, i)[0])
         yield from self._scan(internal_right_child(page))
 
+    # ----- 查询(M3) -----
+
+    def find(self, row_id):
+        """id 等值查找:沿树下降 + 叶内二分。"""
+        page_no = self._leaf_for(row_id)
+        page = self.pager.get_page(page_no)
+        ids = [leaf_cell_id(page, i) for i in range(leaf_cell_count(page))]
+        pos = bisect.bisect_left(ids, row_id)
+        if pos < len(ids) and ids[pos] == row_id:
+            return deserialize_row(leaf_cell(page, pos))
+        return None
+
+    def range_after(self, row_id):
+        """id > row_id:定位起点叶,沿叶链向后收集。"""
+        page_no = self._leaf_for(row_id)
+        result = []
+        while page_no:
+            page = self.pager.get_page(page_no)
+            for i in range(leaf_cell_count(page)):
+                row = deserialize_row(leaf_cell(page, i))
+                if row.id > row_id:
+                    result.append(row)
+            page_no = leaf_next(page)
+        return result
+
+    def range_before(self, row_id):
+        """id < row_id:从最左叶沿叶链收集,遇到 id >= row_id 提前终止。"""
+        page_no = self._leftmost_leaf()
+        result = []
+        while page_no:
+            page = self.pager.get_page(page_no)
+            for i in range(leaf_cell_count(page)):
+                row = deserialize_row(leaf_cell(page, i))
+                if row.id >= row_id:
+                    return result
+                result.append(row)
+            page_no = leaf_next(page)
+        return result
+
+    def _leaf_for(self, row_id):
+        """下降到 row_id 应该所在的叶;超过所有键时落在最右叶。"""
+        page_no = self.pager.root_page
+        while True:
+            page = self.pager.get_page(page_no)
+            if page[0] == NODE_LEAF:
+                return page_no
+            count = internal_cell_count(page)
+            child = internal_right_child(page)
+            for i in range(count):
+                c, key = internal_cell(page, i)
+                if key >= row_id:
+                    child = c
+                    break
+            page_no = child
+
+    def _leftmost_leaf(self):
+        page_no = self.pager.root_page
+        while True:
+            page = self.pager.get_page(page_no)
+            if page[0] == NODE_LEAF:
+                return page_no
+            page_no = internal_cell(page, 0)[0]
+
     def dump_tree(self):
         """返回 (树形文本, 深度层数),供 .dumptree 与测试使用。"""
         lines = []
@@ -394,6 +458,7 @@ HELP = """\
 命令:
   insert <id> <username> <email>   插入一行
   select                           全表扫描(按 id 有序)
+  select <列> <op> <值>            条件查询(op ∈ = > <;id 走索引,其他列全表扫)
 元命令:
   .dbinfo    显示数据库信息
   .dumptree  打印 B-tree 结构(M2)
@@ -424,13 +489,48 @@ class Db:
         if cmd == "insert":
             return self._insert(parts[1:])
         if cmd == "select":
-            if len(parts) != 1:
-                raise MysqliteError("M1 的 select 不带参数(WHERE 在 M3 实现)")
-            rows = list(self.table.scan())
+            if len(parts) == 1:
+                rows = list(self.table.scan())
+                empty_msg = "(空表)"
+            elif len(parts) == 4 and parts[2] in ("=", ">", "<"):
+                rows = self._where(parts[1], parts[2], parts[3])
+                empty_msg = "(无匹配行)"
+            else:
+                raise MysqliteError(
+                    "用法: select | select <列> <op> <值>(op ∈ = > <)")
             if not rows:
-                return "(空表)"
+                return empty_msg
             return "\n".join(repr(row) for row in rows)
         raise MysqliteError(f"无法识别的命令 {cmd!r}(输入 .help 查看帮助)")
+
+    COLUMNS = ("id", "username", "email")
+
+    def _where(self, column, op, raw_value):
+        if column not in self.COLUMNS:
+            raise MysqliteError(
+                f"未知列 {column!r}(可选: id, username, email)")
+        if column == "id":
+            try:
+                value = int(raw_value)
+            except ValueError:
+                raise MysqliteError("id 的比较值必须是整数") from None
+            if op == "=":
+                row = self.table.find(value)
+                return [row] if row is not None else []
+            if op == ">":
+                return self.table.range_after(value)
+            return self.table.range_before(value)
+        # username / email:全表扫描,按字符串比较
+        rows = []
+        for row in self.table.scan():
+            cell = row.username if column == "username" else row.email
+            if op == "=" and cell == raw_value:
+                rows.append(row)
+            elif op == ">" and cell > raw_value:
+                rows.append(row)
+            elif op == "<" and cell < raw_value:
+                rows.append(row)
+        return rows
 
     def _insert(self, args):
         if len(args) != 3:

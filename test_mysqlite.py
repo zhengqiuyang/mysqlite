@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mysqlite import (  # noqa: E402
-    LEAF_HEADER_SIZE, LEAF_MAX_CELLS, MysqliteError, Pager, Row, Table,
+    LEAF_HEADER_SIZE, LEAF_MAX_CELLS, MysqliteError, Pager, Row, Table, Db,
     deserialize_row, serialize_row,
 )
 
@@ -164,6 +164,93 @@ class BTreeTests(unittest.TestCase):
         self.assertIn("[叶]", text)
         self.assertIn("深度:", text)
         self.assertGreaterEqual(depth, 2)
+
+
+class WhereTests(unittest.TestCase):
+    """M3:条件查询(id 走树,其他列全表扫)。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db = Db(os.path.join(tmp.name, "where.db"))
+        self.addCleanup(self.db.close)
+        for i in range(30):
+            self.db.execute(f"insert {i} user{i} u{i}@x")
+
+    def test_id_equality_hit(self):
+        out = self.db.execute("select id = 17")
+        self.assertEqual(out, "(17, user17, u17@x)")
+
+    def test_id_equality_miss(self):
+        self.assertEqual(self.db.execute("select id = 99"), "(无匹配行)")
+
+    def test_id_equality_deep_tree(self):
+        for i in range(30, 3000):
+            self.db.execute(f"insert {i} user{i} u{i}@x")
+        out = self.db.execute("select id = 2999")
+        self.assertEqual(out, "(2999, user2999, u2999@x)")
+        self.assertEqual(self.db.execute("select id = 1234"),
+                         "(1234, user1234, u1234@x)")
+
+    def test_id_greater(self):
+        out = self.db.execute("select id > 26")
+        self.assertEqual(out.splitlines(),
+                         ["(27, user27, u27@x)", "(28, user28, u28@x)",
+                          "(29, user29, u29@x)"])
+        self.assertEqual(self.db.execute("select id > 29"), "(无匹配行)")
+        # 比最大值还大:落在最右叶,叶链走到头
+        self.assertEqual(self.db.execute("select id > 999"), "(无匹配行)")
+
+    def test_id_less(self):
+        out = self.db.execute("select id < 3")
+        self.assertEqual(out.splitlines(),
+                         ["(0, user0, u0@x)", "(1, user1, u1@x)",
+                          "(2, user2, u2@x)"])
+        self.assertEqual(self.db.execute("select id < 0"), "(无匹配行)")
+
+    def test_id_less_spans_leaves(self):
+        # 30 行跨多个叶,验证叶链遍历
+        out = self.db.execute("select id < 25")
+        self.assertEqual(len(out.splitlines()), 25)
+        self.assertTrue(out.startswith("(0, user0, u0@x)"))
+        self.assertTrue(out.endswith("(24, user24, u24@x)"))
+
+    def test_username_equality(self):
+        out = self.db.execute("select username = user5")
+        self.assertEqual(out, "(5, user5, u5@x)")
+        self.assertEqual(self.db.execute("select username = nobody"),
+                         "(无匹配行)")
+
+    def test_username_lexicographic(self):
+        # 字典序:user3 > user28('3' > '2'),但 user0 < user1
+        out = self.db.execute("select username > user28")
+        self.assertEqual(out.splitlines(),
+                         [f"({i}, user{i}, u{i}@x)" for i in (3, 4, 5, 6, 7, 8, 9, 29)])
+        out = self.db.execute("select username < user1")
+        self.assertEqual(out, "(0, user0, u0@x)")
+
+    def test_where_errors(self):
+        with self.assertRaises(MysqliteError) as ctx:
+            self.db.execute("select bogus = 1")
+        self.assertIn("未知列", str(ctx.exception))
+        with self.assertRaises(MysqliteError) as ctx:
+            self.db.execute("select id = abc")
+        self.assertIn("整数", str(ctx.exception))
+        with self.assertRaises(MysqliteError):
+            self.db.execute("select id >= 1")  # 不支持的运算符
+
+    def test_where_via_repl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "r.db")
+            result = subprocess.run(
+                [sys.executable, os.path.join(HERE, "mysqlite.py"), db],
+                input="insert 1 alice a@x\ninsert 2 bob b@x\n"
+                      "select id = 2\nselect username = alice\n"
+                      "select id > 0\n.exit\n",
+                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(2, bob, b@x)", result.stdout)
+        self.assertIn("(1, alice, a@x)", result.stdout)
 
 
 class ReplTests(unittest.TestCase):
